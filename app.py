@@ -1,9 +1,5 @@
-# app.py
-# WORKING NSE JSON API VERSION (NO SCRAPING)
-# 100% works on Render / Railway / Termux
-
 from flask import Flask, jsonify
-import os, requests, time
+import os, requests
 from datetime import datetime
 
 app = Flask(__name__)
@@ -11,108 +7,87 @@ app = Flask(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# NSE headers (required or NSE blocks request)
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com",
-}
-
-session = requests.Session()
-
-def nse_json(url):
-    """Fetch JSON safely from NSE API"""
-    for _ in range(3):
-        try:
-            r = session.get(url, headers=HEADERS, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-        except:
-            time.sleep(1)
-    return None
-
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
-        return r.ok
-    except:
-        return False
+        return r.ok, r.text
+    except Exception as e:
+        return False, str(e)
+
+# INDIA PROXY API (Cloudflare bypass)
+OC_URL = "https://nseindia-api.vercel.app/option-chain?symbol=NIFTY"
+FUT_URL = "https://nseindia-api.vercel.app/future?symbol=NIFTY"
 
 
 @app.route("/send")
 def send_report():
 
-    # 1) OPTION CHAIN JSON
-    oc_url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
-    oc = nse_json(oc_url)
+    # Fetch Proxy OC
+    try:
+        oc = requests.get(OC_URL, timeout=10).json()
+    except:
+        return jsonify({"ok": False, "error": "OC fetch failed"}), 500
 
-    if not oc or "records" not in oc:
-        return jsonify({"ok": False, "error": "OC JSON failed"}), 500
+    if "records" not in oc:
+        return jsonify({"ok": False, "error": "OC JSON invalid"}), 500
 
     records = oc["records"]
     spot = records.get("underlyingValue", 0)
-    data = records.get("data", [])
+    rows = records.get("data", [])
 
-    # Separate CE and PE
-    ce = [x for x in data if "CE" in x]
-    pe = [x for x in data if "PE" in x]
+    # Separate CE PE
+    ce = [x for x in rows if "CE" in x]
+    pe = [x for x in rows if "PE" in x]
 
-    # Pick ATM strike
     strikes = sorted({x["strikePrice"] for x in ce})
     atm = min(strikes, key=lambda x: abs(x - spot))
 
-    # Helper to pick strikes
+    # Helper
     def pick(side_list, side):
         itm = [x for x in side_list if (x["strikePrice"] < atm if side=="CE" else x["strikePrice"] > atm)]
         itm_pick = itm[-1] if itm else None
-
         atm_pick = next((x for x in side_list if x["strikePrice"] == atm), None)
-
         otm = [x for x in side_list if (x["strikePrice"] > atm if side=="CE" else x["strikePrice"] < atm)]
         otm_pick = otm[:3] if side=="CE" else otm[-3:]
-
         return itm_pick, atm_pick, otm_pick
 
     ce_itm, ce_atm, ce_otm = pick(ce, "CE")
     pe_itm, pe_atm, pe_otm = pick(pe, "PE")
 
-    # Format strike output
     def fmt(tag, row, type_):
-        if not row: 
+        if not row:
             return f"{tag}: NA\n"
         d = row[type_]
         ltp = d.get("lastPrice", 0)
         oi = d.get("openInterest", 0)
         coi = d.get("changeinOpenInterest", 0)
-        return (f"{tag} {row['strikePrice']}\n"
-                f" LTP: {ltp} | OI: {oi} | LTP×OI: {ltp*oi}\n"
-                f" COI: {coi} | LTP×COI: {ltp*coi}\n")
+        return (
+            f"{tag} {row['strikePrice']}\n"
+            f" LTP: {ltp} | OI: {oi} | LTP×OI: {ltp*oi}\n"
+            f" COI: {coi} | LTP×COI: {ltp*coi}\n"
+        )
 
-    # 2) FUTURES JSON
-    fut_url = "https://www.nseindia.com/api/quote-derivative?symbol=NIFTY"
-    fut = nse_json(fut_url)
-    fut_msg = ""
-
+    # Fetch FUTURE
     try:
-        fut_data = fut["stocks"][0]["marketDeptOrderBook"]["tradeInfo"]
-        last = fut_data["lastPrice"]
-        change = fut_data["change"]
-        volume = fut_data["totalTradedVolume"]
-        oi = fut_data["openInterest"]
-        fut_msg = (
-            f"\n📘 FUTURES\n"
-            f" Price: {last}\n"
-            f" Change: {change}\n"
-            f" Volume: {volume}\n"
-            f" OI: {oi}\n"
+        fut = requests.get(FUT_URL, timeout=10).json()
+    except:
+        fut = {}
+
+    fut_msg = "\n📘 FUTURE\n"
+    try:
+        f = fut["data"][0]
+        fut_msg += (
+            f" Price: {f.get('lastPrice')}\n"
+            f" Change: {f.get('change')}\n"
+            f" OI: {f.get('openInterest')}\n"
+            f" Volume: {f.get('totalTradedVolume')}\n"
         )
     except:
-        fut_msg = "\n📘 FUTURES: NA\n"
+        fut_msg += " NA\n"
 
     # FINAL MESSAGE
-    msg = (
+    text = (
         f"📌 NIFTY REPORT\n"
         f"Spot: {spot}\nATM: {atm}\nTime: {datetime.now()}\n\n"
 
@@ -129,14 +104,13 @@ def send_report():
         + fut_msg
     )
 
-    ok = send_telegram(msg)
-
-    return jsonify({"ok": ok, "message_sent": msg})
+    ok, resp = send_telegram(text)
+    return jsonify({"ok": ok, "response": resp, "message_sent": text})
 
 
 @app.route("/")
 def home():
-    return "Nifty Bot Running!"
+    return "Nifty Bot Running (Proxy Mode)!"
 
 
 if __name__ == "__main__":
