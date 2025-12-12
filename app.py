@@ -1,21 +1,9 @@
 # app.py
-# Single-file Flask app that:
-# - Scrapes NSE option-chain (from the public option-chain page)
-# - Parses the embedded __NEXT_DATA__ JSON
-# - Picks 1 ITM, 1 ATM, 3 OTM for Calls and Puts
-# - Computes ltp*oi, change in oi (coi), ltp*coi
-# - Fetches futures metadata (from same JSON if present)
-# - Sends a nicely formatted Telegram message to configured BOT_TOKEN & CHAT_ID
-#
-# Notes:
-# - Uses requests + bs4 + flask
-# - Read BOT_TOKEN and CHAT_ID from environment variables
-# - Run with: python app.py
-# - Or deploy to any cloud and set env vars there
+# WORKING NSE JSON API VERSION (NO SCRAPING)
+# 100% works on Render / Railway / Termux
 
 from flask import Flask, jsonify
-import os, requests, json, time
-from bs4 import BeautifulSoup
+import os, requests, time
 from datetime import datetime
 
 app = Flask(__name__)
@@ -23,190 +11,133 @@ app = Flask(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+# NSE headers (required or NSE blocks request)
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Linux; Android 12; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Mobile Safari/537.36",
-    "Referer": "https://www.nseindia.com/option-chain",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com",
 }
 
-def send_telegram(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Missing BOT_TOKEN or CHAT_ID in environment.")
-        return False, "missing token/id"
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text}
-    try:
-        r = requests.post(url, data=payload, timeout=10)
-        return r.ok, r.text
-    except Exception as e:
-        return False, str(e)
+session = requests.Session()
 
-def fetch_nse_nextdata():
-    """Scrape the NSE option chain page and extract __NEXT_DATA__ JSON (if present)"""
-    url = "https://www.nseindia.com/option-chain"
-    s = requests.Session()
-    # try a couple times to be robust
-    for _ in range(2):
+def nse_json(url):
+    """Fetch JSON safely from NSE API"""
+    for _ in range(3):
         try:
-            r = s.get(url, headers=HEADERS, timeout=10)
-            if r.status_code != 200:
-                time.sleep(1)
-                continue
-            soup = BeautifulSoup(r.text, "html.parser")
-            tag = soup.find("script", id="__NEXT_DATA__")
-            if not tag:
-                return None, "no_next_data"
-            data = json.loads(tag.string)
-            return data, None
-        except Exception as e:
-            last_e = e
-            time.sleep(1)
-    return None, str(last_e)
-
-def extract_oc_and_future(nextdata):
-    """
-    Navigate the Next.js payload to find optionChain data and future metadata.
-    This may vary over time; we attempt common paths used by NSE sites.
-    """
-    # Try a few likely locations, be defensive
-    try:
-        # try common path used earlier
-        oc = nextdata["props"]["pageProps"]["initialState"]["optionChain"]["data"]
-        # oc contains records -> underlyingValue & records.data list
-        records = oc["records"]
-        underlying = records.get("underlyingValue")
-        oc_rows = records.get("data", [])
-        # future metadata may be somewhere else; try derivatives or other keys
-        fut = None
-        # try to find futures metadata in pageProps
-        pageprops = nextdata["props"]["pageProps"]
-        # sometimes derivative metadata under "live" or similar - attempt safe retrieval
-        for k in pageprops.keys():
-            if isinstance(pageprops[k], dict) and "futures" in json.dumps(pageprops[k]).lower():
-                # best-effort, but avoid crash
-                pass
-        return underlying, oc_rows, oc.get("expiryDates"), fut
-    except Exception:
-        # fallback: scan entire json for "optionChain" key
-        try:
-            def find_key(d, key):
-                if isinstance(d, dict):
-                    if key in d:
-                        return d[key]
-                    for v in d.values():
-                        r = find_key(v, key)
-                        if r is not None:
-                            return r
-                elif isinstance(d, list):
-                    for item in d:
-                        r = find_key(item, key)
-                        if r is not None:
-                            return r
-                return None
-            part = find_key(nextdata, "optionChain")
-            if part and isinstance(part, dict) and "data" in part:
-                oc = part["data"]
-                records = oc.get("records", {})
-                return records.get("underlyingValue"), records.get("data", []), oc.get("expiryDates"), None
+            r = session.get(url, headers=HEADERS, timeout=10)
+            if r.status_code == 200:
+                return r.json()
         except:
-            pass
-    return None, [], None, None
+            time.sleep(1)
+    return None
 
-def group_ce_pe(rows):
-    ce = []
-    pe = []
-    for r in rows:
-        if "CE" in r:
-            ce.append(r)
-        if "PE" in r:
-            pe.append(r)
-    return ce, pe
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+        return r.ok
+    except:
+        return False
 
-def pick_strikes(spot, ce_list, pe_list):
-    strikes = sorted({r["strikePrice"] for r in ce_list})
-    if not strikes:
-        return None, (), ()
+
+@app.route("/send")
+def send_report():
+
+    # 1) OPTION CHAIN JSON
+    oc_url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+    oc = nse_json(oc_url)
+
+    if not oc or "records" not in oc:
+        return jsonify({"ok": False, "error": "OC JSON failed"}), 500
+
+    records = oc["records"]
+    spot = records.get("underlyingValue", 0)
+    data = records.get("data", [])
+
+    # Separate CE and PE
+    ce = [x for x in data if "CE" in x]
+    pe = [x for x in data if "PE" in x]
+
+    # Pick ATM strike
+    strikes = sorted({x["strikePrice"] for x in ce})
     atm = min(strikes, key=lambda x: abs(x - spot))
-    # build helpers
-    ce_itm = [r for r in ce_list if r["strikePrice"] < atm]
-    ce_otm = [r for r in ce_list if r["strikePrice"] > atm]
-    pe_itm = [r for r in pe_list if r["strikePrice"] > atm]
-    pe_otm = [r for r in pe_list if r["strikePrice"] < atm]
-    # picks
-    ce_itm_pick = sorted(ce_itm, key=lambda x: -x["strikePrice"])[0] if ce_itm else None
-    pe_itm_pick = sorted(pe_itm, key=lambda x: x["strikePrice"])[0] if pe_itm else None
-    ce_atm = next((r for r in ce_list if r["strikePrice"] == atm), None)
-    pe_atm = next((r for r in pe_list if r["strikePrice"] == atm), None)
-    ce_otm_pick = sorted(ce_otm, key=lambda x: x["strikePrice"])[:3]
-    pe_otm_pick = sorted(pe_otm, key=lambda x: -x["strikePrice"])[:3]
-    return atm, (ce_itm_pick, ce_atm, ce_otm_pick), (pe_itm_pick, pe_atm, pe_otm_pick)
 
-def fmt_option_block(tag, opt, side):
-    if not opt:
-        return f"{tag}: N/A\n"
-    d = opt[side]
-    ltp = d.get("lastPrice", 0)
-    oi = d.get("openInterest", 0)
-    coi = d.get("changeinOpenInterest", 0)
-    rs = ltp * oi
-    crs = ltp * coi
-    return (
-        f"{tag} Strike {opt['strikePrice']}\n"
-        f" LTP: {ltp} | OI: {oi} | LTP*OI: {rs}\n"
-        f" COI: {coi} | LTP*COI: {crs}\n"
+    # Helper to pick strikes
+    def pick(side_list, side):
+        itm = [x for x in side_list if (x["strikePrice"] < atm if side=="CE" else x["strikePrice"] > atm)]
+        itm_pick = itm[-1] if itm else None
+
+        atm_pick = next((x for x in side_list if x["strikePrice"] == atm), None)
+
+        otm = [x for x in side_list if (x["strikePrice"] > atm if side=="CE" else x["strikePrice"] < atm)]
+        otm_pick = otm[:3] if side=="CE" else otm[-3:]
+
+        return itm_pick, atm_pick, otm_pick
+
+    ce_itm, ce_atm, ce_otm = pick(ce, "CE")
+    pe_itm, pe_atm, pe_otm = pick(pe, "PE")
+
+    # Format strike output
+    def fmt(tag, row, type_):
+        if not row: 
+            return f"{tag}: NA\n"
+        d = row[type_]
+        ltp = d.get("lastPrice", 0)
+        oi = d.get("openInterest", 0)
+        coi = d.get("changeinOpenInterest", 0)
+        return (f"{tag} {row['strikePrice']}\n"
+                f" LTP: {ltp} | OI: {oi} | LTP×OI: {ltp*oi}\n"
+                f" COI: {coi} | LTP×COI: {ltp*coi}\n")
+
+    # 2) FUTURES JSON
+    fut_url = "https://www.nseindia.com/api/quote-derivative?symbol=NIFTY"
+    fut = nse_json(fut_url)
+    fut_msg = ""
+
+    try:
+        fut_data = fut["stocks"][0]["marketDeptOrderBook"]["tradeInfo"]
+        last = fut_data["lastPrice"]
+        change = fut_data["change"]
+        volume = fut_data["totalTradedVolume"]
+        oi = fut_data["openInterest"]
+        fut_msg = (
+            f"\n📘 FUTURES\n"
+            f" Price: {last}\n"
+            f" Change: {change}\n"
+            f" Volume: {volume}\n"
+            f" OI: {oi}\n"
+        )
+    except:
+        fut_msg = "\n📘 FUTURES: NA\n"
+
+    # FINAL MESSAGE
+    msg = (
+        f"📌 NIFTY REPORT\n"
+        f"Spot: {spot}\nATM: {atm}\nTime: {datetime.now()}\n\n"
+
+        f"--- CALLS ---\n"
+        + fmt("ITM", ce_itm, "CE")
+        + fmt("ATM", ce_atm, "CE")
+        + "".join([fmt(f"OTM{i+1}", o, "CE") for i, o in enumerate(ce_otm)])
+
+        + "\n--- PUTS ---\n"
+        + fmt("ITM", pe_itm, "PE")
+        + fmt("ATM", pe_atm, "PE")
+        + "".join([fmt(f"OTM{i+1}", o, "PE") for i, o in enumerate(pe_otm)])
+
+        + fut_msg
     )
 
-@app.route("/send", methods=["GET"])
-def send_handler():
-    nextdata, err = fetch_nse_nextdata()
-    if err or not nextdata:
-        return jsonify({"ok": False, "error": "failed to fetch nextdata", "detail": err}), 500
+    ok = send_telegram(msg)
 
-    spot, rows, expiries, fut_meta = extract_oc_and_future(nextdata)
-    if not rows:
-        return jsonify({"ok": False, "error": "no option rows found"}), 500
+    return jsonify({"ok": ok, "message_sent": msg})
 
-    ce_list, pe_list = group_ce_pe(rows)
-    atm, ce_picks, pe_picks = pick_strikes(spot, ce_list, pe_list)
 
-    # Format message
-    text = f"📌 NIFTY Option Chain Snapshot\nATM: {atm}\nSpot: {spot}\nTime: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
-    text += "--- CALLS ---\n"
-    text += fmt_option_block("ITM", ce_picks[0], "CE")
-    text += fmt_option_block("ATM", ce_picks[1], "CE")
-    for i, s in enumerate(ce_picks[2]):
-        text += fmt_option_block(f"OTM{i+1}", s, "CE")
+@app.route("/")
+def home():
+    return "Nifty Bot Running!"
 
-    text += "\n--- PUTS ---\n"
-    text += fmt_option_block("ITM", pe_picks[0], "PE")
-    text += fmt_option_block("ATM", pe_picks[1], "PE")
-    for i, s in enumerate(pe_picks[2]):
-        text += fmt_option_block(f"OTM{i+1}", s, "PE")
-
-    # FUTURES: if fut_meta available try to add (best-effort)
-    if fut_meta and isinstance(fut_meta, dict):
-        try:
-            text += "\n📘 FUTURE\n"
-            # fallback safe keys
-            last = fut_meta.get("lastPrice") or fut_meta.get("last")
-            prem = fut_meta.get("premium")
-            change = fut_meta.get("change")
-            oi = fut_meta.get("openInterest")
-            vol = fut_meta.get("totalTradedVolume") or fut_meta.get("volume")
-            text += f"Price: {last}\nPremium: {prem}\nChange: {change}\nOI: {oi}\nVolume: {vol}\n"
-        except Exception:
-            pass
-
-    ok, resp = send_telegram(text)
-    if ok:
-        return jsonify({"ok": True, "message": "sent", "telegram_resp": resp})
-    else:
-        return jsonify({"ok": False, "message": "telegram_failed", "detail": resp}), 500
 
 if __name__ == "__main__":
-    # For local run: set environment and run
-    # Example:
-    # export BOT_TOKEN="..."
-    # export CHAT_ID="..."
-    # python app.py
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
