@@ -2,7 +2,7 @@ import os
 import time
 import pyotp
 import requests
-from smartapi import SmartConnect
+from SmartApi import SmartConnect
 
 # ---------- ENV ----------
 API_KEY = os.getenv("ANGEL_API_KEY")
