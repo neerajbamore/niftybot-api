@@ -1,3 +1,5 @@
 smartapi-python
-python-dotenv
 requests
+pyotp
+schedule
+pandas
