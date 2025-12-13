@@ -4,3 +4,4 @@ pyotp
 schedule
 pandas
 logzero
+websocket-client
