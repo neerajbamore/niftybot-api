@@ -1,3 +1,3 @@
-flask
+smartapi-python
+python-dotenv
 requests
-beautifulsoup4
