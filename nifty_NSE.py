@@ -1,111 +1,72 @@
 import os
 import time
 import requests
-import pyotp
 from datetime import datetime
-from SmartApi import SmartConnect
 
-# ================== ENV ==================
-API_KEY = os.getenv("ANGEL_API_KEY")
-CLIENT_ID = os.getenv("ANGEL_CLIENT_ID")
-PASSWORD = os.getenv("ANGEL_PASSWORD")
-TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
-
-BOT_TOKEN = os.getenv("NIFTY_NSE_BOT")   # 👈 tumhara new bot token
+BOT_TOKEN = os.getenv("NIFTY_NSE_BOT")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# ================== TELEGRAM ==================
+INTERVAL_SECONDS = 138  # 2.3 minutes
+
+# ---------- TELEGRAM ----------
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={
-            "chat_id": CHAT_ID,
-            "text": msg
-        }, timeout=5)
+        requests.post(
+            url,
+            data={"chat_id": CHAT_ID, "text": msg},
+            timeout=5
+        )
     except:
         pass
 
-# ================== ANGEL LOGIN ==================
-def angel_login():
-    totp = pyotp.TOTP(TOTP_SECRET).now()
-    obj = SmartConnect(api_key=API_KEY)
-    obj.generateSession(CLIENT_ID, PASSWORD, totp)
-    return obj
+# ---------- NSE SESSION ----------
+def get_nse_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com"
+    })
+    session.get("https://www.nseindia.com", timeout=5)
+    return session
 
-# ================== INSTRUMENT MASTER ==================
-def load_instruments():
-    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    return requests.get(url).json()
+# ---------- FETCH NIFTY ----------
+def get_nifty_spot():
+    session = get_nse_session()
+    url = "https://www.nseindia.com/api/allIndices"
+    data = session.get(url, timeout=5).json()
 
-# ================== TOKENS ==================
-def get_nifty_spot_token(instruments):
-    for i in instruments:
-        if i["name"] == "NIFTY" and i["symbol"] == "NIFTY" and i["exch_seg"] == "NSE":
-            return i["token"]
+    for idx in data["data"]:
+        if idx["index"] == "NIFTY 50":
+            return round(idx["last"], 2)
     return None
 
-def get_nifty_fut_token(instruments):
-    futs = []
-    for i in instruments:
-        if (
-            i["name"] == "NIFTY"
-            and i["instrumenttype"] == "FUTIDX"
-            and i["exch_seg"] == "NFO"
-        ):
-            futs.append(i)
-
-    futs.sort(key=lambda x: datetime.strptime(x["expiry"], "%d%b%Y"))
-    return futs[0]["symbol"], futs[0]["token"]
-
-# ================== LTP ==================
-def get_ltp(obj, exchange, symbol, token):
-    data = obj.ltpData(exchange, symbol, token)
-    return float(data["data"]["ltp"])
-
-# ================== MARKET HOURS ==================
+# ---------- MARKET HOURS ----------
 def market_open():
     now = datetime.now().time()
     return (
-        now >= datetime.strptime("09:20", "%H:%M").time()
-        and now <= datetime.strptime("15:25", "%H:%M").time()
+        now >= datetime.strptime("09:15", "%H:%M").time()
+        and now <= datetime.strptime("15:30", "%H:%M").time()
     )
 
-# ================== JOB ==================
-def nifty_job():
-    if not market_open():
-        return
+# ---------- MAIN ----------
+def main():
+    send_telegram("🚀 NIFTY NSE (Direct) bot started")
 
-    try:
-        obj = angel_login()
-        instruments = load_instruments()
+    while True:
+        try:
+            if market_open():
+                nifty = get_nifty_spot()
+                if nifty:
+                    send_telegram(
+                        f"📊 NIFTY 50 (NSE)\n\nSpot : {nifty}"
+                    )
+        except Exception as e:
+            send_telegram(f"❌ NSE Error\n{e}")
 
-        # Spot
-        spot_token = get_nifty_spot_token(instruments)
-        spot = get_ltp(obj, "NSE", "NIFTY", spot_token)
+        time.sleep(INTERVAL_SECONDS)
 
-        # Future (near expiry)
-        fut_symbol, fut_token = get_nifty_fut_token(instruments)
-        fut = get_ltp(obj, "NFO", fut_symbol, fut_token)
-
-        premium = round(fut - spot, 2)
-
-        msg = (
-            "📊 NIFTY NSE LIVE\n\n"
-            f"Spot : {spot}\n"
-            f"Future : {fut}\n"
-            f"Premium : {premium}"
-        )
-
-        send_telegram(msg)
-
-    except Exception as e:
-        send_telegram(f"❌ NIFTY NSE Error\n{e}")
-
-# ================== START ==================
-send_telegram("🚀 NIFTY NSE bot started")
-
-INTERVAL_SECONDS = 138   # 2.3 minutes
-
-while True:
-    nifty_job()
-    time.sleep(INTERVAL_SECONDS)
+if __name__ == "__main__":
+    main()
