@@ -16,15 +16,19 @@ TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
 BOT_TOKEN = os.getenv("NIFTY_NSE_BOT")
 CHAT_ID = os.getenv("CHAT_ID")
 
-INTERVAL_SECONDS = 138  # ~2.3 min
+INTERVAL_SECONDS = 120   # 2 min for debug
 DB_FILE = "oi_snapshot.db"
 
 # ================== TELEGRAM ==================
 def send_telegram(msg):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": msg}
-    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": CHAT_ID, "text": msg},
+            timeout=10
+        )
+    except Exception as e:
+        print("Telegram error:", e)
 
 # ================== ANGEL LOGIN ==================
 def angel_login():
@@ -41,8 +45,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS snapshot (
             symbol TEXT PRIMARY KEY,
             ltp REAL,
-            oi INTEGER,
-            volume INTEGER
+            oi INTEGER
         )
     """)
     conn.commit()
@@ -51,8 +54,8 @@ def init_db():
 def load_prev():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT symbol, ltp, oi, volume FROM snapshot")
-    data = {r[0]: r[1:] for r in c.fetchall()}
+    c.execute("SELECT symbol, ltp, oi FROM snapshot")
+    data = {r[0]: (r[1], r[2]) for r in c.fetchall()}
     conn.close()
     return data
 
@@ -60,7 +63,7 @@ def save_curr(rows):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     for r in rows:
-        c.execute("REPLACE INTO snapshot VALUES (?,?,?,?)", r)
+        c.execute("REPLACE INTO snapshot VALUES (?,?,?)", r)
     conn.commit()
     conn.close()
 
@@ -79,35 +82,29 @@ def build_strikes(atm):
         "PE": [atm+50, atm, atm-50, atm-100, atm-150]
     }
 
-# ================== OPTION SYMBOL ==================
+# ================== OPTION FINDER ==================
 def find_option(instruments, strike, opt_type):
     for i in instruments:
         if (
-            i["name"] == "NIFTY"
-            and i["instrumenttype"] == "OPTIDX"
-            and int(float(i["strike"])) == strike
-            and i["symbol"].endswith(opt_type)
+            i.get("name") == "NIFTY"
+            and i.get("instrumenttype") == "OPTIDX"
+            and int(float(i.get("strike", 0))) == strike
+            and i.get("symbol", "").endswith(opt_type)
         ):
             return i["symbol"], i["token"]
     return None, None
 
-# ================== LTP / QUOTE ==================
-def get_quote(obj, exch, symbol, token):
+# ================== LTP + OI ==================
+def get_ltp_oi(obj, symbol, token):
     q = obj.getMarketData("LTP", {
-        "exchangeTokens": {exch: [token]}
+        "exchangeTokens": {"NFO": [token]}
     })
     d = q["data"]["fetched"][0]
-    return float(d["ltp"]), int(d["oi"]), int(d["tradeVolume"])
-
-# ================== MARKET HOURS ==================
-def market_open():
-    t = datetime.now().time()
-    return t >= datetime.strptime("09:15", "%H:%M").time() and \
-           t <= datetime.strptime("15:30", "%H:%M").time()
+    return float(d["ltp"]), int(d["oi"])
 
 # ================== MAIN ==================
 def main():
-    send_telegram("🚀 NIFTY OPTIONS OI BOT STARTED")
+    send_telegram("🚀 NIFTY OI BOT DEBUG MODE STARTED")
     init_db()
 
     instruments = load_instruments()
@@ -115,50 +112,52 @@ def main():
 
     while True:
         try:
-            if not market_open():
-                time.sleep(INTERVAL_SECONDS)
-                continue
+            send_telegram("🧪 LOOP ENTERED")
 
             obj = angel_login()
 
-            # -------- Spot --------
-            spot_token = next(i["token"] for i in instruments if i["symbol"]=="NIFTY" and i["exch_seg"]=="NSE")
-            spot = float(obj.ltpData("NSE","NIFTY",spot_token)["data"]["ltp"])
-
+            # -------- SPOT --------
+            spot_token = next(
+                i["token"] for i in instruments
+                if i["symbol"] == "NIFTY" and i["exch_seg"] == "NSE"
+            )
+            spot = float(obj.ltpData("NSE", "NIFTY", spot_token)["data"]["ltp"])
             atm = atm_strike(spot)
-            strikes = build_strikes(atm)
 
+            send_telegram(f"📍 SPOT OK\nSpot: {spot}\nATM: {atm}")
+
+            strikes = build_strikes(atm)
             curr_rows = []
+
             ce_val = pe_val = ce_chg = pe_chg = 0
 
-            for side in ["CE","PE"]:
+            for side in ["CE", "PE"]:
                 for strike in strikes[side]:
                     sym, tok = find_option(instruments, strike, side)
                     if not tok:
+                        send_telegram(f"⚠️ Missing {strike}{side}")
                         continue
 
-                    ltp, oi, vol = get_quote(obj,"NFO",sym,tok)
-                    curr_rows.append((sym,ltp,oi,vol))
+                    ltp, oi = get_ltp_oi(obj, sym, tok)
+                    curr_rows.append((sym, ltp, oi))
 
-                    prev_ltp, prev_oi, prev_vol = prev.get(sym,(0,0,0))
-
+                    prev_ltp, prev_oi = prev.get(sym, (0, 0))
                     val = ltp * oi
-                    prev_val = prev_ltp * prev_oi
-                    d_val = val - prev_val
+                    dval = val - (prev_ltp * prev_oi)
 
-                    if side=="CE":
+                    if side == "CE":
                         ce_val += val
-                        ce_chg += d_val
+                        ce_chg += dval
                     else:
                         pe_val += val
-                        pe_chg += d_val
+                        pe_chg += dval
 
             save_curr(curr_rows)
 
             bias = "BULLISH 🔼" if pe_chg > ce_chg else "BEARISH 🔽"
 
             send_telegram(
-                f"📊 NIFTY OI UPDATE\n\n"
+                f"📊 OI DEBUG DATA\n\n"
                 f"ATM : {atm}\n\n"
                 f"CALL LTP×OI : {round(ce_val/1e7,2)} Cr\n"
                 f"ΔCALL       : {round(ce_chg/1e7,2)} Cr\n\n"
