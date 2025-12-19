@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import sqlite3
 import requests
 import pyotp
@@ -16,7 +15,7 @@ TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
 BOT_TOKEN = os.getenv("NIFTY_NSE_BOT")
 CHAT_ID = os.getenv("CHAT_ID")
 
-INTERVAL_SECONDS = 120   # 2 min for debug
+INTERVAL_SECONDS = 138   # ~2.3 min
 DB_FILE = "oi_snapshot.db"
 
 # ================== TELEGRAM ==================
@@ -72,6 +71,19 @@ def load_instruments():
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     return requests.get(url, timeout=20).json()
 
+# ================== EXPIRY ==================
+def get_near_expiry(instruments):
+    expiries = set()
+    for i in instruments:
+        if i["name"] == "NIFTY" and i["instrumenttype"] == "OPTIDX":
+            expiries.add(i["expiry"])
+
+    expiry_dates = sorted(
+        expiries,
+        key=lambda x: datetime.strptime(x, "%d%b%Y")
+    )
+    return expiry_dates[0]
+
 # ================== STRIKES ==================
 def atm_strike(spot):
     return int(round(spot / 50) * 50)
@@ -83,36 +95,51 @@ def build_strikes(atm):
     }
 
 # ================== OPTION FINDER ==================
-def find_option(instruments, strike, opt_type):
+def find_option(instruments, strike, opt_type, expiry):
     for i in instruments:
         if (
-            i.get("name") == "NIFTY"
-            and i.get("instrumenttype") == "OPTIDX"
-            and int(float(i.get("strike", 0))) == strike
-            and i.get("symbol", "").endswith(opt_type)
+            i["name"] == "NIFTY"
+            and i["instrumenttype"] == "OPTIDX"
+            and i["expiry"] == expiry
+            and int(float(i["strike"])) == strike
+            and i["symbol"].endswith(opt_type)
         ):
             return i["symbol"], i["token"]
     return None, None
 
 # ================== LTP + OI ==================
 def get_ltp_oi(obj, symbol, token):
-    q = obj.getMarketData("LTP", {
-        "exchangeTokens": {"NFO": [token]}
-    })
+    q = obj.getMarketData(
+        "LTP",
+        {"exchangeTokens": {"NFO": [token]}}
+    )
     d = q["data"]["fetched"][0]
     return float(d["ltp"]), int(d["oi"])
 
+# ================== MARKET HOURS ==================
+def market_open():
+    t = datetime.now().time()
+    return (
+        t >= datetime.strptime("09:15", "%H:%M").time()
+        and t <= datetime.strptime("15:30", "%H:%M").time()
+    )
+
 # ================== MAIN ==================
 def main():
-    send_telegram("🚀 NIFTY OI BOT DEBUG MODE STARTED")
+    send_telegram("🚀 NIFTY OPTIONS OI BOT LIVE")
     init_db()
 
     instruments = load_instruments()
+    expiry = get_near_expiry(instruments)
+    send_telegram(f"📅 Near Expiry : {expiry}")
+
     prev = load_prev()
 
     while True:
         try:
-            send_telegram("🧪 LOOP ENTERED")
+            if not market_open():
+                time.sleep(INTERVAL_SECONDS)
+                continue
 
             obj = angel_login()
 
@@ -124,8 +151,6 @@ def main():
             spot = float(obj.ltpData("NSE", "NIFTY", spot_token)["data"]["ltp"])
             atm = atm_strike(spot)
 
-            send_telegram(f"📍 SPOT OK\nSpot: {spot}\nATM: {atm}")
-
             strikes = build_strikes(atm)
             curr_rows = []
 
@@ -133,9 +158,8 @@ def main():
 
             for side in ["CE", "PE"]:
                 for strike in strikes[side]:
-                    sym, tok = find_option(instruments, strike, side)
+                    sym, tok = find_option(instruments, strike, side, expiry)
                     if not tok:
-                        send_telegram(f"⚠️ Missing {strike}{side}")
                         continue
 
                     ltp, oi = get_ltp_oi(obj, sym, tok)
@@ -157,7 +181,7 @@ def main():
             bias = "BULLISH 🔼" if pe_chg > ce_chg else "BEARISH 🔽"
 
             send_telegram(
-                f"📊 OI DEBUG DATA\n\n"
+                f"📊 NIFTY OI UPDATE\n\n"
                 f"ATM : {atm}\n\n"
                 f"CALL LTP×OI : {round(ce_val/1e7,2)} Cr\n"
                 f"ΔCALL       : {round(ce_chg/1e7,2)} Cr\n\n"
