@@ -15,7 +15,7 @@ TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
 BOT_TOKEN = os.getenv("NIFTY_NSE_BOT")
 CHAT_ID = os.getenv("CHAT_ID")
 
-INTERVAL_SECONDS = 138   # ~2.3 min
+INTERVAL_SECONDS = 138   # ~2.3 minutes
 DB_FILE = "oi_snapshot.db"
 
 # ================== TELEGRAM ==================
@@ -94,17 +94,20 @@ def build_strikes(atm):
         "PE": [atm+50, atm, atm-50, atm-100, atm-150]
     }
 
-# ================== OPTION FINDER ==================
+# ================== OPTION FINDER (🔥 FIXED STRIKE ×100) ==================
 def find_option(instruments, strike, opt_type, expiry):
+    target = strike * 100   # 🔥 Angel OPTIDX strike rule
+
     for i in instruments:
         if (
             i["name"] == "NIFTY"
             and i["instrumenttype"] == "OPTIDX"
             and i["expiry"] == expiry
-            and int(float(i["strike"])) == strike
+            and int(float(i["strike"])) == target
             and i["symbol"].endswith(opt_type)
         ):
             return i["symbol"], i["token"]
+
     return None, None
 
 # ================== LTP + OI ==================
