@@ -15,7 +15,7 @@ TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
 BOT_TOKEN = os.getenv("NIFTY_NSE_BOT")
 CHAT_ID = os.getenv("CHAT_ID")
 
-INTERVAL_SECONDS = 120   # 2 min (safe)
+INTERVAL_SECONDS = 138
 DB_FILE = "oi_snapshot.db"
 
 # ================= TELEGRAM =================
@@ -92,8 +92,7 @@ def build_strikes(atm):
 
 # ================= OPTION FINDER =================
 def find_option(instruments, strike, opt_type, expiry):
-    target = strike * 100   # Angel OPTIDX scale fix
-
+    target = strike * 100
     for i in instruments:
         if (
             i["name"] == "NIFTY"
@@ -103,7 +102,6 @@ def find_option(instruments, strike, opt_type, expiry):
             and i["symbol"].endswith(opt_type)
         ):
             return i["symbol"], i["token"]
-
     return None, None
 
 # ================= SAFE LTP + OI =================
@@ -112,11 +110,9 @@ def get_ltp_oi(obj, token):
         "LTP",
         {"exchangeTokens": {"NFO": [token]}}
     )
-
     fetched = q.get("data", {}).get("fetched", [])
     if not fetched:
-        raise Exception("Angel returned empty OI data")
-
+        return 0, 0
     d = fetched[0]
     return float(d.get("ltp", 0)), int(d.get("oi", 0))
 
@@ -141,15 +137,13 @@ def main():
 
     while True:
         try:
-            send_telegram("💓 OI LOOP ACTIVE")
-
             if not market_open():
                 time.sleep(INTERVAL_SECONDS)
                 continue
 
             obj = angel_login()
 
-            # -------- SPOT --------
+            # SPOT
             spot_token = next(
                 i["token"] for i in instruments
                 if i["symbol"] == "NIFTY" and i["exch_seg"] == "NSE"
@@ -161,6 +155,7 @@ def main():
             curr_rows = []
 
             ce_val = pe_val = ce_chg = pe_chg = 0
+            valid_oi_found = False
 
             for side in ["CE", "PE"]:
                 for strike in strikes[side]:
@@ -169,6 +164,10 @@ def main():
                         continue
 
                     ltp, oi = get_ltp_oi(obj, tok)
+                    if oi == 0:
+                        continue
+
+                    valid_oi_found = True
                     curr_rows.append((sym, ltp, oi))
 
                     prev_ltp, prev_oi = prev.get(sym, (0, 0))
@@ -181,6 +180,10 @@ def main():
                     else:
                         pe_val += val
                         pe_chg += dval
+
+            if not valid_oi_found:
+                time.sleep(INTERVAL_SECONDS)
+                continue
 
             save_curr(curr_rows)
 
@@ -196,11 +199,8 @@ def main():
                 f"SHIFT : {bias}"
             )
 
-        except Exception as e:
-            send_telegram(
-                "❌ OI ERROR\n"
-                f"{type(e).__name__} : {e}"
-            )
+        except:
+            pass
 
         time.sleep(INTERVAL_SECONDS)
 
