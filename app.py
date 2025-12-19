@@ -11,78 +11,52 @@ CLIENT_ID = os.getenv("ANGEL_CLIENT_ID")
 PASSWORD = os.getenv("ANGEL_PASSWORD")
 TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
 
-BOT_TOKEN = os.getenv("NIFTY_NSE_BOT")   # same telegram bot
+BOT_TOKEN = os.getenv("NIFTY_NSE_BOT")
 CHAT_ID = os.getenv("CHAT_ID")
 
-INTERVAL_SECONDS = 138  # ~2.3 minutes
+INTERVAL_SECONDS = 120  # 2 min test
 
 # ========== TELEGRAM ==========
 def send_telegram(msg):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(
-            url,
-            data={"chat_id": CHAT_ID, "text": msg},
-            timeout=10
-        )
-    except Exception as e:
-        print("Telegram error:", e)
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
 # ========== ANGEL LOGIN ==========
 def angel_login():
     totp = pyotp.TOTP(TOTP_SECRET).now()
     obj = SmartConnect(api_key=API_KEY)
-    obj.generateSession(CLIENT_ID, PASSWORD, totp)
-    return obj
+    data = obj.generateSession(CLIENT_ID, PASSWORD, totp)
+    return obj, data
 
-# ========== INSTRUMENT MASTER ==========
+# ========== LOAD INSTRUMENTS ==========
 def load_instruments():
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-    return requests.get(url, timeout=15).json()
+    return requests.get(url, timeout=20).json()
 
-# ========== TOKEN HELPERS ==========
+# ========== TOKENS ==========
 def get_nifty_spot_token(instruments):
     for i in instruments:
-        if (
-            i.get("name") == "NIFTY"
-            and i.get("symbol") == "NIFTY"
-            and i.get("exch_seg") == "NSE"
-        ):
+        if i["name"] == "NIFTY" and i["symbol"] == "NIFTY" and i["exch_seg"] == "NSE":
             return i["token"]
     raise Exception("NIFTY spot token not found")
 
 def get_nifty_fut_token(instruments):
     futs = []
     for i in instruments:
-        if (
-            i.get("name") == "NIFTY"
-            and i.get("instrumenttype") == "FUTIDX"
-            and i.get("exch_seg") == "NFO"
-        ):
+        if i["name"] == "NIFTY" and i["instrumenttype"] == "FUTIDX":
             futs.append(i)
-
-    if not futs:
-        raise Exception("No NIFTY futures found")
 
     futs.sort(key=lambda x: datetime.strptime(x["expiry"], "%d%b%Y"))
     return futs[0]["symbol"], futs[0]["token"]
 
 # ========== LTP ==========
-def get_ltp(obj, exchange, symbol, token):
-    data = obj.ltpData(exchange, symbol, token)
+def get_ltp(obj, exch, sym, token):
+    data = obj.ltpData(exch, sym, token)
     return float(data["data"]["ltp"])
-
-# ========== MARKET HOURS ==========
-def market_open():
-    now = datetime.now().time()
-    return (
-        now >= datetime.strptime("09:15", "%H:%M").time()
-        and now <= datetime.strptime("15:30", "%H:%M").time()
-    )
 
 # ========== MAIN ==========
 def main():
-    send_telegram("🚀 NIFTY Angel bot started (Spot + Future)")
+    send_telegram("🧪 Angel DEBUG MODE STARTED")
 
     instruments = load_instruments()
     spot_token = get_nifty_spot_token(instruments)
@@ -90,23 +64,22 @@ def main():
 
     while True:
         try:
-            if market_open():
-                obj = angel_login()
+            obj, session = angel_login()
 
-                spot = get_ltp(obj, "NSE", "NIFTY", spot_token)
-                fut = get_ltp(obj, "NFO", fut_symbol, fut_token)
-                premium = round(fut - spot, 2)
+            spot = get_ltp(obj, "NSE", "NIFTY", spot_token)
+            fut = get_ltp(obj, "NFO", fut_symbol, fut_token)
 
-                msg = (
-                    "📊 NIFTY LIVE (Angel)\n\n"
-                    f"Spot   : {spot}\n"
-                    f"Future : {fut}\n"
-                    f"Premium: {premium}"
-                )
-                send_telegram(msg)
+            premium = round(fut - spot, 2)
+
+            send_telegram(
+                "🧪 ANGEL TEST\n\n"
+                f"Spot   : {spot}\n"
+                f"Future : {fut}\n"
+                f"Premium: {premium}"
+            )
 
         except Exception as e:
-            send_telegram(f"❌ Angel Error\n{e}")
+            send_telegram(f"❌ ANGEL ERROR\n{e}")
 
         time.sleep(INTERVAL_SECONDS)
 
