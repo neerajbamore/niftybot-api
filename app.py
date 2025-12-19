@@ -6,7 +6,7 @@ import pyotp
 from datetime import datetime
 from SmartApi import SmartConnect
 
-# ================== ENV ==================
+# ================= ENV =================
 API_KEY = os.getenv("ANGEL_API_KEY")
 CLIENT_ID = os.getenv("ANGEL_CLIENT_ID")
 PASSWORD = os.getenv("ANGEL_PASSWORD")
@@ -15,10 +15,10 @@ TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
 BOT_TOKEN = os.getenv("NIFTY_NSE_BOT")
 CHAT_ID = os.getenv("CHAT_ID")
 
-INTERVAL_SECONDS = 138   # ~2.3 minutes
+INTERVAL_SECONDS = 120   # 2 min (safe)
 DB_FILE = "oi_snapshot.db"
 
-# ================== TELEGRAM ==================
+# ================= TELEGRAM =================
 def send_telegram(msg):
     try:
         requests.post(
@@ -26,17 +26,17 @@ def send_telegram(msg):
             data={"chat_id": CHAT_ID, "text": msg},
             timeout=10
         )
-    except Exception as e:
-        print("Telegram error:", e)
+    except:
+        pass
 
-# ================== ANGEL LOGIN ==================
+# ================= ANGEL LOGIN =================
 def angel_login():
     totp = pyotp.TOTP(TOTP_SECRET).now()
     obj = SmartConnect(api_key=API_KEY)
     obj.generateSession(CLIENT_ID, PASSWORD, totp)
     return obj
 
-# ================== DB ==================
+# ================= DB =================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
@@ -66,25 +66,21 @@ def save_curr(rows):
     conn.commit()
     conn.close()
 
-# ================== INSTRUMENT MASTER ==================
+# ================= INSTRUMENT MASTER =================
 def load_instruments():
     url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
     return requests.get(url, timeout=20).json()
 
-# ================== EXPIRY ==================
+# ================= EXPIRY =================
 def get_near_expiry(instruments):
-    expiries = set()
-    for i in instruments:
-        if i["name"] == "NIFTY" and i["instrumenttype"] == "OPTIDX":
-            expiries.add(i["expiry"])
-
-    expiry_dates = sorted(
-        expiries,
+    expiries = sorted(
+        {i["expiry"] for i in instruments
+         if i["name"] == "NIFTY" and i["instrumenttype"] == "OPTIDX"},
         key=lambda x: datetime.strptime(x, "%d%b%Y")
     )
-    return expiry_dates[0]
+    return expiries[0]
 
-# ================== STRIKES ==================
+# ================= STRIKES =================
 def atm_strike(spot):
     return int(round(spot / 50) * 50)
 
@@ -94,9 +90,9 @@ def build_strikes(atm):
         "PE": [atm+50, atm, atm-50, atm-100, atm-150]
     }
 
-# ================== OPTION FINDER (🔥 FIXED STRIKE ×100) ==================
+# ================= OPTION FINDER =================
 def find_option(instruments, strike, opt_type, expiry):
-    target = strike * 100   # 🔥 Angel OPTIDX strike rule
+    target = strike * 100   # Angel OPTIDX scale fix
 
     for i in instruments:
         if (
@@ -110,16 +106,21 @@ def find_option(instruments, strike, opt_type, expiry):
 
     return None, None
 
-# ================== LTP + OI ==================
-def get_ltp_oi(obj, symbol, token):
+# ================= SAFE LTP + OI =================
+def get_ltp_oi(obj, token):
     q = obj.getMarketData(
         "LTP",
         {"exchangeTokens": {"NFO": [token]}}
     )
-    d = q["data"]["fetched"][0]
-    return float(d["ltp"]), int(d["oi"])
 
-# ================== MARKET HOURS ==================
+    fetched = q.get("data", {}).get("fetched", [])
+    if not fetched:
+        raise Exception("Angel returned empty OI data")
+
+    d = fetched[0]
+    return float(d.get("ltp", 0)), int(d.get("oi", 0))
+
+# ================= MARKET HOURS =================
 def market_open():
     t = datetime.now().time()
     return (
@@ -127,7 +128,7 @@ def market_open():
         and t <= datetime.strptime("15:30", "%H:%M").time()
     )
 
-# ================== MAIN ==================
+# ================= MAIN =================
 def main():
     send_telegram("🚀 NIFTY OPTIONS OI BOT LIVE")
     init_db()
@@ -140,6 +141,8 @@ def main():
 
     while True:
         try:
+            send_telegram("💓 OI LOOP ACTIVE")
+
             if not market_open():
                 time.sleep(INTERVAL_SECONDS)
                 continue
@@ -165,7 +168,7 @@ def main():
                     if not tok:
                         continue
 
-                    ltp, oi = get_ltp_oi(obj, sym, tok)
+                    ltp, oi = get_ltp_oi(obj, tok)
                     curr_rows.append((sym, ltp, oi))
 
                     prev_ltp, prev_oi = prev.get(sym, (0, 0))
@@ -194,7 +197,10 @@ def main():
             )
 
         except Exception as e:
-            send_telegram(f"❌ OI ERROR\n{e}")
+            send_telegram(
+                "❌ OI ERROR\n"
+                f"{type(e).__name__} : {e}"
+            )
 
         time.sleep(INTERVAL_SECONDS)
 
